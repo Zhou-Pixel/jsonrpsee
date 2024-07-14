@@ -25,9 +25,11 @@
 // DEALINGS IN THE SOFTWARE.
 
 use std::error::Error as StdError;
+use std::fmt::Debug;
 use std::future::Future;
 use std::net::{SocketAddr, TcpListener as StdTcpListener};
 use std::pin::Pin;
+use std::str::FromStr;
 use std::sync::atomic::AtomicU32;
 use std::sync::Arc;
 use std::task::Poll;
@@ -58,6 +60,7 @@ use jsonrpsee_types::error::{
 };
 use jsonrpsee_types::{ErrorObject, Id, InvalidRequest, Notification};
 use soketto::handshake::http::is_upgrade_request;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream, ToSocketAddrs};
 use tokio::sync::{mpsc, watch, OwnedSemaphorePermit};
 use tokio_util::compat::TokioAsyncReadCompatExt;
@@ -67,38 +70,74 @@ use tracing::{instrument, Instrument};
 
 type Notif<'a> = Notification<'a, Option<&'a JsonRawValue>>;
 
+pub trait QueryAddress {
+	fn query_local_addr(&self) -> std::io::Result<SocketAddr>;
+}
+
+impl QueryAddress for TcpStream {
+	fn query_local_addr(&self) -> std::io::Result<SocketAddr> {
+		self.local_addr()
+	}
+}
+
+impl QueryAddress for TcpListener {
+	fn query_local_addr(&self) -> std::io::Result<SocketAddr> {
+		self.local_addr()
+	}
+}
+
+impl QueryAddress for tokio_stream::wrappers::TcpListenerStream {
+	fn query_local_addr(&self) -> std::io::Result<SocketAddr> {
+		self.as_ref().local_addr()
+	}
+}
+
 /// Default maximum connections allowed.
 const MAX_CONNECTIONS: u32 = 100;
 
 /// JSON RPC server.
-pub struct Server<HttpMiddleware = Identity, RpcMiddleware = Identity> {
-	listener: TcpListener,
+pub struct Server<L = tokio_stream::wrappers::TcpListenerStream, HttpMiddleware = Identity, RpcMiddleware = Identity> {
+	listener: L,
 	server_cfg: ServerConfig,
 	rpc_middleware: RpcServiceBuilder<RpcMiddleware>,
 	http_middleware: tower::ServiceBuilder<HttpMiddleware>,
 }
 
-impl Server<Identity, Identity> {
+impl Server<tokio_stream::wrappers::TcpListenerStream, Identity, Identity>
+// where
+// 	L: tokio_stream::Stream<Item = std::io::Result<S>>,
+// 	S: AsyncWrite + AsyncRead + Unpin + Send + 'static
+{
 	/// Create a builder for the server.
 	pub fn builder() -> Builder<Identity, Identity> {
 		Builder::new()
 	}
 }
 
-impl<RpcMiddleware, HttpMiddleware> std::fmt::Debug for Server<RpcMiddleware, HttpMiddleware> {
+impl<L, S, RpcMiddleware, HttpMiddleware> std::fmt::Debug for Server<L, RpcMiddleware, HttpMiddleware>
+where
+	L: tokio_stream::Stream<Item = std::io::Result<S>> + Debug,
+	S: AsyncWrite + AsyncRead + Unpin + Send + 'static,
+{
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
 		f.debug_struct("Server").field("listener", &self.listener).field("server_cfg", &self.server_cfg).finish()
 	}
 }
 
-impl<RpcMiddleware, HttpMiddleware> Server<RpcMiddleware, HttpMiddleware> {
+impl<L, S, RpcMiddleware, HttpMiddleware> Server<L, RpcMiddleware, HttpMiddleware>
+where
+	L: tokio_stream::Stream<Item = std::io::Result<S>> + QueryAddress,
+	S: AsyncWrite + AsyncRead + Unpin + Send + 'static,
+{
 	/// Returns socket address to which the server is bound.
 	pub fn local_addr(&self) -> std::io::Result<SocketAddr> {
-		self.listener.local_addr()
+		// self.listener.local_addr()
+		// Err(std::io::Error::new(std::io::ErrorKind::Other, ""))
+		self.listener.query_local_addr()
 	}
 }
 
-impl<HttpMiddleware, RpcMiddleware, Body> Server<HttpMiddleware, RpcMiddleware>
+impl<L, S, HttpMiddleware, RpcMiddleware, Body> Server<L, HttpMiddleware, RpcMiddleware>
 where
 	RpcMiddleware: tower::Layer<RpcService> + Clone + Send + 'static,
 	for<'a> <RpcMiddleware as Layer<RpcService>>::Service: RpcServiceT<'a>,
@@ -109,6 +148,8 @@ where
 	Body: http_body::Body<Data = Bytes> + Send + 'static,
 	<Body as http_body::Body>::Error: Into<BoxError>,
 	<Body as http_body::Body>::Data: Send,
+	L: tokio_stream::Stream<Item = std::io::Result<S>> + Send + Unpin + 'static,
+	S: AsyncWrite + AsyncRead + Unpin + Send + 'static,
 {
 	/// Start responding to connections requests.
 	///
@@ -130,7 +171,7 @@ where
 	async fn start_inner(self, methods: Methods, stop_handle: StopHandle) {
 		let mut id: u32 = 0;
 		let connection_guard = ConnectionGuard::new(self.server_cfg.max_connections as usize);
-		let listener = self.listener;
+		let mut listener = self.listener;
 
 		let stopped = stop_handle.clone().shutdown();
 		tokio::pin!(stopped);
@@ -138,7 +179,7 @@ where
 		let (drop_on_completion, mut process_connection_awaiter) = mpsc::channel::<()>(1);
 
 		loop {
-			match try_accept_conn(&listener, stopped).await {
+			match try_accept_conn(&mut listener, stopped).await {
 				AcceptConnection::Established { socket, remote_addr, stop } => {
 					process_connection(ProcessConnection {
 						http_middleware: &self.http_middleware,
@@ -878,9 +919,12 @@ impl<HttpMiddleware, RpcMiddleware> Builder<HttpMiddleware, RpcMiddleware> {
 	/// }
 	/// ```
 	///
-	pub async fn build(self, addrs: impl ToSocketAddrs) -> std::io::Result<Server<HttpMiddleware, RpcMiddleware>> {
+	pub async fn build(
+		self,
+		addrs: impl ToSocketAddrs,
+	) -> std::io::Result<Server<tokio_stream::wrappers::TcpListenerStream, HttpMiddleware, RpcMiddleware>> {
 		let listener = TcpListener::bind(addrs).await?;
-
+		let listener = tokio_stream::wrappers::TcpListenerStream::new(listener);
 		Ok(Server {
 			listener,
 			server_cfg: self.server_cfg,
@@ -915,8 +959,9 @@ impl<HttpMiddleware, RpcMiddleware> Builder<HttpMiddleware, RpcMiddleware> {
 	pub fn build_from_tcp(
 		self,
 		listener: impl Into<StdTcpListener>,
-	) -> std::io::Result<Server<HttpMiddleware, RpcMiddleware>> {
+	) -> std::io::Result<Server<tokio_stream::wrappers::TcpListenerStream, HttpMiddleware, RpcMiddleware>> {
 		let listener = TcpListener::from_std(listener.into())?;
+		let listener = tokio_stream::wrappers::TcpListenerStream::new(listener);
 
 		Ok(Server {
 			listener,
@@ -1154,22 +1199,23 @@ where
 	}
 }
 
-struct ProcessConnection<'a, HttpMiddleware, RpcMiddleware> {
+struct ProcessConnection<'a, HttpMiddleware, RpcMiddleware, T: AsyncRead + AsyncWrite + Unpin + Send + 'static> {
 	http_middleware: &'a tower::ServiceBuilder<HttpMiddleware>,
 	rpc_middleware: RpcServiceBuilder<RpcMiddleware>,
 	conn_guard: &'a ConnectionGuard,
 	conn_id: u32,
 	server_cfg: ServerConfig,
 	stop_handle: StopHandle,
-	socket: TcpStream,
+	socket: T,
 	drop_on_completion: mpsc::Sender<()>,
 	remote_addr: SocketAddr,
 	methods: Methods,
 }
 
 #[instrument(name = "connection", skip_all, fields(remote_addr = %params.remote_addr, conn_id = %params.conn_id), level = "INFO")]
-fn process_connection<'a, RpcMiddleware, HttpMiddleware, Body>(params: ProcessConnection<HttpMiddleware, RpcMiddleware>)
-where
+fn process_connection<'a, RpcMiddleware, HttpMiddleware, Body, T: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
+	params: ProcessConnection<HttpMiddleware, RpcMiddleware, T>,
+) where
 	RpcMiddleware: 'static,
 	HttpMiddleware: Layer<TowerServiceNoHttp<RpcMiddleware>> + Send + 'static,
 	<HttpMiddleware as Layer<TowerServiceNoHttp<RpcMiddleware>>>::Service:
@@ -1193,10 +1239,10 @@ where
 		..
 	} = params;
 
-	if let Err(e) = socket.set_nodelay(server_cfg.tcp_no_delay) {
-		tracing::warn!(target: LOG_TARGET, "Could not set NODELAY on socket: {:?}", e);
-		return;
-	}
+	// if let Err(e) = socket.set_nodelay(server_cfg.tcp_no_delay) {
+	// 	tracing::warn!(target: LOG_TARGET, "Could not set NODELAY on socket: {:?}", e);
+	// 	return;
+	// }
 
 	let tower_service = TowerServiceNoHttp {
 		inner: ServiceData {
@@ -1240,23 +1286,33 @@ where
 	});
 }
 
-enum AcceptConnection<S> {
+enum AcceptConnection<S, St: AsyncRead + AsyncWrite + Unpin + Send> {
 	Shutdown,
-	Established { socket: TcpStream, remote_addr: SocketAddr, stop: S },
+	Established { socket: St, remote_addr: SocketAddr, stop: S },
 	Err((std::io::Error, S)),
 }
 
-async fn try_accept_conn<S>(listener: &TcpListener, stopped: S) -> AcceptConnection<S>
+async fn try_accept_conn<L, S, St>(listener: &mut L, stopped: S) -> AcceptConnection<S, St>
 where
 	S: Future + Unpin,
+	L: tokio_stream::Stream<Item = std::io::Result<St>> + Unpin + 'static,
+	St: AsyncWrite + AsyncRead + Unpin + Send + 'static,
 {
-	let accept = listener.accept();
+	use tokio_stream::StreamExt;
+	let accept = listener.next();
 	tokio::pin!(accept);
 
 	match futures_util::future::select(accept, stopped).await {
 		Either::Left((res, stop)) => match res {
-			Ok((socket, remote_addr)) => AcceptConnection::Established { socket, remote_addr, stop },
-			Err(e) => AcceptConnection::Err((e, stop)),
+			Some(Ok(stream)) => AcceptConnection::Established {
+				socket: stream,
+				remote_addr: SocketAddr::from_str("0.0.0.0:0").unwrap(),
+				stop,
+			},
+			Some(Err(e)) => AcceptConnection::Err((e, stop)),
+			None => AcceptConnection::Shutdown,
+			// Ok((socket, remote_addr)) => AcceptConnection::Established { socket, remote_addr, stop },
+			// Err(e) => AcceptConnection::Err((e, stop)),
 		},
 		Either::Right(_) => AcceptConnection::Shutdown,
 	}
